@@ -1,4 +1,6 @@
-const { useState, useEffect, useRef, useMemo, useCallback } = React;
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import ReactDOM from "react-dom/client";
+
 
 // ───────── Seeded PRNG (mulberry32) ─────────
 function makeRng(seed) {
