@@ -1,6 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
-import ReactDOM from "react-dom/client";
-
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
 
 // ───────── Seeded PRNG (mulberry32) ─────────
 function makeRng(seed) {
@@ -778,8 +776,9 @@ function App() {
   const invertColors = () => setState((s) => ({ ...s, fg: s.bg, bg: s.fg }));
   const resetPostFX = () => setState((s) => ({ ...s, postfx: DEFAULT_STATE.postfx }));
 
-  // Render texture (with post-FX)
+  // Render texture (with post-FX) — debounced so rapid slider moves don't stack renders
   useEffect(() => {
+    const tid = setTimeout(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     canvas.width = state.width;
@@ -872,6 +871,8 @@ function App() {
     }
 
     setRenderTime(performance.now() - t0);
+    }, 80); // debounce — wait 80ms after last change before rendering
+    return () => clearTimeout(tid);
   }, [state]);
 
   // Fit canvas to stage
