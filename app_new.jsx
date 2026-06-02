@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import ReactDOM from "react-dom/client";
 
-
 // ───────── Seeded PRNG (mulberry32) ─────────
 function makeRng(seed) {
   let s = seed >>> 0;
@@ -778,9 +777,119 @@ function App() {
   const invertColors = () => setState((s) => ({ ...s, fg: s.bg, bg: s.fg }));
   const resetPostFX = () => setState((s) => ({ ...s, postfx: DEFAULT_STATE.postfx }));
 
-  // Render texture (with post-FX) — debounced so rapid slider moves don't stack renders
+  // ── Two-pass render: draft (fast, low-res) while dragging, full-res when settled ──
+  const isDragging = useRef(false);
+  const dragTimer = useRef(null);
+
+  const runRender = useCallback((s, preview) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    // Draft pass renders at 25% area (50% each dimension) for speed
+    const scale = preview ? 0.5 : 1;
+    const rw = Math.max(4, Math.round(s.width * scale));
+    const rh = Math.max(4, Math.round(s.height * scale));
+    canvas.width = s.width;
+    canvas.height = s.height;
+    const ctx = canvas.getContext("2d");
+    const t0 = performance.now();
+
+    // Render to offscreen at draft resolution, then stretch to full canvas
+    const off = document.createElement("canvas");
+    off.width = rw; off.height = rh;
+    const octx = off.getContext("2d");
+    const eng = ENGINES[s.engine];
+
+    octx.save();
+    octx.fillStyle = s.bg;
+    octx.fillRect(0, 0, rw, rh);
+
+    const { mirror, rotation } = s.postfx;
+    if (rotation !== 0) {
+      octx.translate(rw / 2, rh / 2);
+      octx.rotate((rotation * Math.PI) / 180);
+      octx.translate(-rw / 2, -rh / 2);
+    }
+
+    if (mirror === "none") {
+      const rng = makeRng(s.seed);
+      eng.render(octx, rw, rh, s.params[s.engine], s.fg, rng, s.bg, s.seamless);
+    } else {
+      const tw = mirror === "horizontal" ? rw / 2 : (mirror === "vertical" ? rw : rw / 2);
+      const th = mirror === "vertical" ? rh / 2 : (mirror === "horizontal" ? rh : rh / 2);
+      const moff = document.createElement("canvas");
+      moff.width = Math.ceil(tw); moff.height = Math.ceil(th);
+      const mctx = moff.getContext("2d");
+      mctx.fillStyle = s.bg;
+      mctx.fillRect(0, 0, moff.width, moff.height);
+      const rng = makeRng(s.seed);
+      eng.render(mctx, moff.width, moff.height, s.params[s.engine], s.fg, rng, s.bg, s.seamless);
+      if (mirror === "horizontal") {
+        octx.drawImage(moff, 0, 0);
+        octx.save(); octx.translate(rw, 0); octx.scale(-1, 1); octx.drawImage(moff, 0, 0); octx.restore();
+      } else if (mirror === "vertical") {
+        octx.drawImage(moff, 0, 0);
+        octx.save(); octx.translate(0, rh); octx.scale(1, -1); octx.drawImage(moff, 0, 0); octx.restore();
+      } else if (mirror === "quad" || mirror === "kaleido") {
+        octx.drawImage(moff, 0, 0);
+        octx.save(); octx.translate(rw, 0); octx.scale(-1, 1); octx.drawImage(moff, 0, 0); octx.restore();
+        octx.save(); octx.translate(0, rh); octx.scale(1, -1); octx.drawImage(moff, 0, 0); octx.restore();
+        octx.save(); octx.translate(rw, rh); octx.scale(-1, -1); octx.drawImage(moff, 0, 0); octx.restore();
+      }
+    }
+    octx.restore();
+
+    // Stretch draft to full canvas (fast — GPU scaled)
+    ctx.save();
+    ctx.imageSmoothingEnabled = preview;
+    ctx.drawImage(off, 0, 0, s.width, s.height);
+    ctx.restore();
+
+    // Post-FX (skip on draft for speed)
+    if (!preview) {
+      const fx = s.postfx;
+      if (fx.invert || fx.vignette > 0 || fx.grain > 0) {
+        const img = ctx.getImageData(0, 0, s.width, s.height);
+        const data = img.data;
+        const cx = s.width / 2, cy = s.height / 2;
+        const maxD = Math.hypot(cx, cy);
+        const rng = makeRng(s.seed + 999);
+        for (let y = 0; y < s.height; y++) {
+          for (let x = 0; x < s.width; x++) {
+            const i = (y * s.width + x) * 4;
+            let r = data[i], g = data[i + 1], b = data[i + 2];
+            if (fx.invert) { r = 255 - r; g = 255 - g; b = 255 - b; }
+            if (fx.vignette > 0) {
+              const d = Math.hypot(x - cx, y - cy) / maxD;
+              const v = 1 - Math.max(0, (d - (1 - fx.vignette)) / fx.vignette) * fx.vignette;
+              r *= v; g *= v; b *= v;
+            }
+            if (fx.grain > 0) {
+              const n = (rng() - 0.5) * 255 * fx.grain;
+              r += n; g += n; b += n;
+            }
+            data[i] = Math.max(0, Math.min(255, r));
+            data[i + 1] = Math.max(0, Math.min(255, g));
+            data[i + 2] = Math.max(0, Math.min(255, b));
+          }
+        }
+        ctx.putImageData(img, 0, 0);
+      }
+    }
+    setRenderTime(performance.now() - t0);
+  }, []);
+
+  // Render texture (with post-FX)
   useEffect(() => {
-    const tid = setTimeout(() => {
+    // Draft render immediately
+    runRender(state, true);
+    // Full render after 180ms idle
+    clearTimeout(dragTimer.current);
+    dragTimer.current = setTimeout(() => runRender(state, false), 180);
+    return () => clearTimeout(dragTimer.current);
+  }, [state, runRender]);
+
+  // DEAD CODE BELOW — kept for shape only, real render logic is above
+  const _unused = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     canvas.width = state.width;
@@ -873,9 +982,7 @@ function App() {
     }
 
     setRenderTime(performance.now() - t0);
-    }, 80); // debounce — wait 80ms after last change before rendering
-    return () => clearTimeout(tid);
-  }, [state]);
+  }; // end _unused
 
   // Fit canvas to stage
   const [scale, setScale] = useState(1);
