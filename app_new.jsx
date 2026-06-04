@@ -1,5 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
-import ReactDOM from "react-dom/client";
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
 
 // ───────── Seeded PRNG (mulberry32) ─────────
 function makeRng(seed) {
@@ -625,6 +624,23 @@ const DEFAULT_STATE = {
   },
 };
 
+// ───────── Intro sequence ─────────
+// Four visually striking presets that auto-cycle on first load
+const INTRO_SEQUENCE = [
+  { engine: "truchet", patch: { tileSize: 36, weight: 2.4, variant: 0, density: 1, chaos: 0.5 }, fg: "#1a1816", bg: "#f4f1ea", seed: 12345 },
+  { engine: "flow",    patch: { particles: 400, length: 80, stepSize: 2, curl: 3.5, weight: 0.6 }, fg: "#2c4a3e", bg: "#f0ead8", seed: 7777 },
+  { engine: "voronoi", patch: { cells: 60, strokeWeight: 1.2, shading: 0.5, irregularity: 0.9, borderFade: 0 }, fg: "#3a4a6b", bg: "#e8e4d8", seed: 54321 },
+  { engine: "hex",     patch: { size: 22, weight: 1.2, fillChance: 0.3, inset: 0.08, breakage: 0.1 }, fg: "#c4593a", bg: "#f4f1ea", seed: 9999 },
+];
+
+// Four quick-start presets shown prominently at top of panel
+const QUICKSTART_PRESETS = [
+  { name: "Arches",    engine: "truchet", patch: { tileSize: 48, weight: 2.5, variant: 0, density: 1, chaos: 0.5 }, fg: "#1a1816", bg: "#f4f1ea" },
+  { name: "Smoke",     engine: "flow",    patch: { particles: 500, length: 90, stepSize: 1.8, curl: 3, weight: 0.5 }, fg: "#1a1816", bg: "#ede8df" },
+  { name: "Stone",     engine: "voronoi", patch: { cells: 80, strokeWeight: 0.8, shading: 0.5, irregularity: 0.8, borderFade: 0 }, fg: "#2a2520", bg: "#ede8df" },
+  { name: "Honeycomb", engine: "hex",     patch: { size: 18, weight: 1.2, fillChance: 0.15, inset: 0.1, breakage: 0 }, fg: "#c4593a", bg: "#f4f1ea" },
+];
+
 const ASPECT_PRESETS = [
   { label: "1:1", w: 1000, h: 1000 },
   { label: "4:3", w: 1200, h: 900 },
@@ -745,6 +761,61 @@ function App() {
   const [redoStack, setRedoStack] = useState([]);
   const skipUndo = useRef(false);
 
+  // ─── Intro sequence ───────────────────────────
+  // Only runs once per browser session (not on shared-URL loads)
+  const isSharedURL = window.location.hash.startsWith("#s=");
+  const hasSeenIntro = sessionStorage.getItem("tx-intro-done") === "1";
+  const [introActive, setIntroActive] = useState(!isSharedURL && !hasSeenIntro);
+  const [introOpacity, setIntroOpacity] = useState(1);
+  const [randPulse, setRandPulse] = useState(!isSharedURL && !hasSeenIntro);
+  const introIndexRef = useRef(0);
+  const introTimerRef = useRef(null);
+
+  const dismissIntro = useCallback(() => {
+    if (!introActive) return;
+    clearInterval(introTimerRef.current);
+    setIntroOpacity(0);
+    setTimeout(() => setIntroActive(false), 500);
+    sessionStorage.setItem("tx-intro-done", "1");
+    // Stop pulse after a beat
+    setTimeout(() => setRandPulse(false), 8000);
+  }, [introActive]);
+
+  useEffect(() => {
+    if (!introActive) return;
+    // Apply first intro preset immediately
+    const applyIntroPreset = (idx) => {
+      const p = INTRO_SEQUENCE[idx % INTRO_SEQUENCE.length];
+      const eng = ENGINES[p.engine];
+      setState((s) => ({
+        ...s,
+        engine: p.engine,
+        fg: p.fg,
+        bg: p.bg,
+        seed: p.seed,
+        params: { ...s.params, [p.engine]: { ...eng.params && Object.fromEntries(Object.entries(eng.params).map(([k,v])=>[k,v.default])), ...p.patch } },
+      }));
+    };
+    applyIntroPreset(0);
+    introTimerRef.current = setInterval(() => {
+      introIndexRef.current += 1;
+      applyIntroPreset(introIndexRef.current);
+      if (introIndexRef.current >= INTRO_SEQUENCE.length - 1) {
+        clearInterval(introTimerRef.current);
+        // After last preset, dismiss after a short pause
+        setTimeout(dismissIntro, 1800);
+      }
+    }, 1600);
+    return () => clearInterval(introTimerRef.current);
+  }, []); // eslint-disable-line
+
+  // Stop rand pulse after 8s even if intro was already skipped
+  useEffect(() => {
+    if (!randPulse) return;
+    const t = setTimeout(() => setRandPulse(false), 8000);
+    return () => clearTimeout(t);
+  }, [randPulse]);
+
   const engine = ENGINES[state.engine];
 
   const updateParam = (key, value) => {
@@ -777,119 +848,8 @@ function App() {
   const invertColors = () => setState((s) => ({ ...s, fg: s.bg, bg: s.fg }));
   const resetPostFX = () => setState((s) => ({ ...s, postfx: DEFAULT_STATE.postfx }));
 
-  // ── Two-pass render: draft (fast, low-res) while dragging, full-res when settled ──
-  const isDragging = useRef(false);
-  const dragTimer = useRef(null);
-
-  const runRender = useCallback((s, preview) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    // Draft pass renders at 25% area (50% each dimension) for speed
-    const scale = preview ? 0.5 : 1;
-    const rw = Math.max(4, Math.round(s.width * scale));
-    const rh = Math.max(4, Math.round(s.height * scale));
-    canvas.width = s.width;
-    canvas.height = s.height;
-    const ctx = canvas.getContext("2d");
-    const t0 = performance.now();
-
-    // Render to offscreen at draft resolution, then stretch to full canvas
-    const off = document.createElement("canvas");
-    off.width = rw; off.height = rh;
-    const octx = off.getContext("2d");
-    const eng = ENGINES[s.engine];
-
-    octx.save();
-    octx.fillStyle = s.bg;
-    octx.fillRect(0, 0, rw, rh);
-
-    const { mirror, rotation } = s.postfx;
-    if (rotation !== 0) {
-      octx.translate(rw / 2, rh / 2);
-      octx.rotate((rotation * Math.PI) / 180);
-      octx.translate(-rw / 2, -rh / 2);
-    }
-
-    if (mirror === "none") {
-      const rng = makeRng(s.seed);
-      eng.render(octx, rw, rh, s.params[s.engine], s.fg, rng, s.bg, s.seamless);
-    } else {
-      const tw = mirror === "horizontal" ? rw / 2 : (mirror === "vertical" ? rw : rw / 2);
-      const th = mirror === "vertical" ? rh / 2 : (mirror === "horizontal" ? rh : rh / 2);
-      const moff = document.createElement("canvas");
-      moff.width = Math.ceil(tw); moff.height = Math.ceil(th);
-      const mctx = moff.getContext("2d");
-      mctx.fillStyle = s.bg;
-      mctx.fillRect(0, 0, moff.width, moff.height);
-      const rng = makeRng(s.seed);
-      eng.render(mctx, moff.width, moff.height, s.params[s.engine], s.fg, rng, s.bg, s.seamless);
-      if (mirror === "horizontal") {
-        octx.drawImage(moff, 0, 0);
-        octx.save(); octx.translate(rw, 0); octx.scale(-1, 1); octx.drawImage(moff, 0, 0); octx.restore();
-      } else if (mirror === "vertical") {
-        octx.drawImage(moff, 0, 0);
-        octx.save(); octx.translate(0, rh); octx.scale(1, -1); octx.drawImage(moff, 0, 0); octx.restore();
-      } else if (mirror === "quad" || mirror === "kaleido") {
-        octx.drawImage(moff, 0, 0);
-        octx.save(); octx.translate(rw, 0); octx.scale(-1, 1); octx.drawImage(moff, 0, 0); octx.restore();
-        octx.save(); octx.translate(0, rh); octx.scale(1, -1); octx.drawImage(moff, 0, 0); octx.restore();
-        octx.save(); octx.translate(rw, rh); octx.scale(-1, -1); octx.drawImage(moff, 0, 0); octx.restore();
-      }
-    }
-    octx.restore();
-
-    // Stretch draft to full canvas (fast — GPU scaled)
-    ctx.save();
-    ctx.imageSmoothingEnabled = preview;
-    ctx.drawImage(off, 0, 0, s.width, s.height);
-    ctx.restore();
-
-    // Post-FX (skip on draft for speed)
-    if (!preview) {
-      const fx = s.postfx;
-      if (fx.invert || fx.vignette > 0 || fx.grain > 0) {
-        const img = ctx.getImageData(0, 0, s.width, s.height);
-        const data = img.data;
-        const cx = s.width / 2, cy = s.height / 2;
-        const maxD = Math.hypot(cx, cy);
-        const rng = makeRng(s.seed + 999);
-        for (let y = 0; y < s.height; y++) {
-          for (let x = 0; x < s.width; x++) {
-            const i = (y * s.width + x) * 4;
-            let r = data[i], g = data[i + 1], b = data[i + 2];
-            if (fx.invert) { r = 255 - r; g = 255 - g; b = 255 - b; }
-            if (fx.vignette > 0) {
-              const d = Math.hypot(x - cx, y - cy) / maxD;
-              const v = 1 - Math.max(0, (d - (1 - fx.vignette)) / fx.vignette) * fx.vignette;
-              r *= v; g *= v; b *= v;
-            }
-            if (fx.grain > 0) {
-              const n = (rng() - 0.5) * 255 * fx.grain;
-              r += n; g += n; b += n;
-            }
-            data[i] = Math.max(0, Math.min(255, r));
-            data[i + 1] = Math.max(0, Math.min(255, g));
-            data[i + 2] = Math.max(0, Math.min(255, b));
-          }
-        }
-        ctx.putImageData(img, 0, 0);
-      }
-    }
-    setRenderTime(performance.now() - t0);
-  }, []);
-
   // Render texture (with post-FX)
   useEffect(() => {
-    // Draft render immediately
-    runRender(state, true);
-    // Full render after 180ms idle
-    clearTimeout(dragTimer.current);
-    dragTimer.current = setTimeout(() => runRender(state, false), 180);
-    return () => clearTimeout(dragTimer.current);
-  }, [state, runRender]);
-
-  // DEAD CODE BELOW — kept for shape only, real render logic is above
-  const _unused = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     canvas.width = state.width;
@@ -982,7 +942,7 @@ function App() {
     }
 
     setRenderTime(performance.now() - t0);
-  }; // end _unused
+  }, [state]);
 
   // Fit canvas to stage
   const [scale, setScale] = useState(1);
@@ -1163,7 +1123,7 @@ function App() {
       if (mod && (e.key === "s" || e.key === "S")) { e.preventDefault(); saveToLibrary(); return; }
       if (e.key === "?" || (e.shiftKey && e.key === "/")) { e.preventDefault(); setShowHelp((s) => !s); return; }
       if (e.key === "Escape") { setShowHelp(false); return; }
-      if (e.code === "Space") { e.preventDefault(); randomize(); }
+      if (e.code === "Space") { e.preventDefault(); randomize(); dismissIntro(); }
       else if (e.key === "e" || e.key === "E") exportPNG();
       else if (e.key === "t" || e.key === "T") setShowTile((s) => !s);
       else if (e.key === "i" || e.key === "I") invertColors();
@@ -1214,7 +1174,7 @@ function App() {
           <button className="btn ghost icon-btn" onClick={() => setShowHelp(true)} title="How it works">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 015 0c0 1.5-2 2-2.5 3.5M12 17h.01"/></svg>
           </button>
-          <button className="btn ghost" onClick={randomize} title="Randomize seed (Space)">
+          <button className={"btn ghost" + (randPulse ? " rand-pulse" : "")} onClick={() => { randomize(); dismissIntro(); }} title="Randomize seed (Space)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
             Randomize
           </button>
@@ -1266,6 +1226,23 @@ function App() {
       </header>
 
       <div className="main">
+        {/* ─── Intro overlay ─── */}
+        {introActive && (
+          <div
+            className="intro-overlay"
+            style={{ opacity: introOpacity, transition: introOpacity < 1 ? "opacity 0.5s ease" : "none" }}
+            onClick={dismissIntro}
+          >
+            <div className="intro-content">
+              <div className="intro-title mono">texture/maker</div>
+              <div className="intro-sub">procedural pattern studio</div>
+              <div className="intro-cta">
+                <span className="intro-cta-key">Space</span>
+                <span className="intro-cta-text">or click any preset to explore</span>
+              </div>
+            </div>
+          </div>
+        )}
         {/* ─── Stage ─── */}
         <div className="stage" ref={stageRef} style={{ background: state.bg === "#f4f1ea" ? "#ebe7dd" : "#1a1816" }}>
           <div className="stage-grid"></div>
@@ -1333,6 +1310,31 @@ function App() {
 
         {/* ─── Controls ─── */}
         <aside className="panel">
+          {/* Quick-start — above the fold, first thing a new user sees */}
+          <div className="panel-section qs-section">
+            <div className="section-head">
+              <span className="section-num">↓</span>
+              <span className="section-title">Quick start</span>
+              <span className="section-sub">click to apply</span>
+            </div>
+            <div className="qs-grid">
+              {QUICKSTART_PRESETS.map((p, i) => (
+                <button key={i} className="qs-btn" onClick={() => { applyPreset(p); dismissIntro(); }}>
+                  <QSThumb preset={p} />
+                  <span className="qs-name">{p.name}</span>
+                </button>
+              ))}
+            </div>
+            <button
+              className={"qs-randomize-big" + (randPulse ? " rand-pulse" : "")}
+              onClick={() => { randomize(); dismissIntro(); }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
+              Randomize seed
+              <span className="qs-rand-hint mono">Space</span>
+            </button>
+          </div>
+
           <div className="panel-section">
             <div className="section-head">
               <span className="section-num">01</span>
@@ -1870,6 +1872,22 @@ function HelpOverlay({ onClose }) {
       </div>
     </div>
   );
+}
+
+function QSThumb({ preset }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const c = ref.current;
+    if (!c) return;
+    c.width = 120; c.height = 80;
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = preset.bg;
+    ctx.fillRect(0, 0, 120, 80);
+    const rng = makeRng(13);
+    const params = { ...Object.fromEntries(Object.entries(ENGINES[preset.engine].params).map(([k, v]) => [k, v.default])), ...preset.patch };
+    ENGINES[preset.engine].render(ctx, 120, 80, params, preset.fg, rng, preset.bg, true);
+  }, [preset]);
+  return <canvas ref={ref} className="qs-thumb-canvas" />;
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
