@@ -1311,3 +1311,14 @@ body {
   background: #1a1816 !important;
   color: #f4f1ea !important;
 }
+
+/* ─── Hide panel during intro so canvas fills screen ─── */
+.intro-active .panel {
+  display: none;
+}
+.intro-active .main {
+  grid-template-columns: 1fr;
+}
+.intro-active .stage {
+  width: 100vw;
+}
